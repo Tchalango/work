@@ -1,80 +1,66 @@
-Nickel — ton screenshot montre que **le pipeline tourne pour de vrai** sur `dcomp.dll` et qu’il a déjà sorti une **première “carte” d’angles d’attaque** :
+Parfait — ton triage est exactement ce que tu veux voir : **B002 (2 hits)** sort du lot, **B005 (5 hits)** ensuite, et **A001** sert surtout à “pointer les zones OO chaudes” (vtable 0x1801bba90).
 
-* **A001 (189)** = “virtual dispatch sans validation” → très fréquent → souvent beaucoup de bruit, mais ça sert à trouver les zones OO chaudes.
-* **B002 (2)** = `PropVariantClear/Copy` → rare → **très bon candidat à triager en premier**.
-* **B005 (5)** = `CoCreateInstance/CoGetClassObject` → intéressant (COM/factories) → à vérifier si CLSID/IID ou chemins d’erreur mal gérés.
-
-Je te donne maintenant un **plan d’actions + commandes** pour passer de “j’ai un report” à “j’ai 2-3 sites P1 à regarder”.
+Je te donne maintenant **les commandes concrètes** pour passer en “vraie analyse” (headless, tunnel) sur ces 3 axes.
 
 ---
 
-## 1) Fixe les variables (copier-coller)
+## 0) Variables (copie-colle)
 
-Adapte juste le dossier `OUT` si besoin.
+Adapte juste si ton path est différent.
 
 ```bash
-TC_HOME="$HOME/type_confusing"
+TC_HOME="/home/PC/type_confusing"
 OUT="$TC_HOME/output/dcomp_final1"
-
-# projet ghidra créé par ton wrapper (souvent: projects/<name>_project)
-PROJ="$TC_HOME/projects/dcomp_project"
-NAME="dcomp"
 BIN="/mnt/c/Windows/System32/dcomp.dll"
+
+# Trouver automatiquement le projet Ghidra utilisé
+PROJ="$(ls -d "$TC_HOME"/projects/*dcomp* 2>/dev/null | head -n 1)"
+NAME="dcomp"
+
+echo "PROJ=$PROJ"
+ls -la "$OUT"
 ```
+
+> Si `PROJ` est vide, liste tes projets : `ls -la $TC_HOME/projects`
 
 ---
 
-## 2) Regarde la forme exacte de `findings.json` (1 commande)
+## 1) Extraire les 2 adresses B002 + les 5 B005 depuis findings.json
 
-Ça évite de deviner les champs (pattern/category/etc.).
+Ton résumé montre “B002 / B005”, donc on filtre large (code/pattern/category).
 
 ```bash
-jq 'keys' "$OUT/findings.json"
-jq '.findings[0]' "$OUT/findings.json" | sed -n '1,80p'
+# B002
+jq -r '
+  .findings[]
+  | select(((.code // .pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
+  | .address
+' "$OUT/findings.json" | nl
+
+# B005
+jq -r '
+  .findings[]
+  | select(((.code // .pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
+  | .address
+' "$OUT/findings.json" | nl
 ```
 
 ---
 
-## 3) Extraire **B002** (PropVariant) + **B005** (COM) (commande robuste)
+## 2) Inspect automatique des sites B002 (priorité #1)
 
-Même si tes champs s’appellent `pattern` ou `category`, ça marche parce qu’on matche au texte.
-
-```bash
-# B002: PropVariant
-jq -r '
-  .findings[]
-  | select(((.pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
-  | "\(.address) | \(.function // "unknown") | \(.api // .title // "n/a")"
-' "$OUT/findings.json"
-
-# B005: COM create
-jq -r '
-  .findings[]
-  | select(((.pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
-  | "\(.address) | \(.function // "unknown") | \(.api // .title // "n/a")"
-' "$OUT/findings.json"
-```
-
-👉 Objectif : avoir **les 2 adresses B002** et les **5 adresses B005**.
-
----
-
-## 4) Inspect automatique des adresses (génère des fichiers texte)
-
-Ça te sort le **code décompilé + instructions autour** sans GUI (parfait sur tunnel).
-
-### Inspect B002 (priorité #1)
+Ça te sort des fichiers texte avec **décompilation + instructions**.
 
 ```bash
 mkdir -p "$OUT/inspect"
 
 jq -r '
   .findings[]
-  | select(((.pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
+  | select(((.code // .pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
   | .address
 ' "$OUT/findings.json" \
 | while read -r ADDR; do
-    echo "[*] Inspect $ADDR"
+    echo "[*] Inspect B002 at $ADDR"
     "$GHIDRA_HOME/support/analyzeHeadless" \
       "$PROJ" "$NAME" \
       -process "$(basename "$BIN")" \
@@ -83,18 +69,136 @@ jq -r '
       -postScript inspect_address.py "$ADDR" \
       > "$OUT/inspect/B002_${ADDR//:/_}.txt" 2>&1
   done
+
+ls -ლა "$OUT/inspect"/B002_*.txt
 ```
 
-### Inspect B005 (COM)
+### Lecture rapide “est-ce chaud ?”
+
+```bash
+grep -nEi "vt|V_VT|PropVariant|pwsz|bstr|punk|ulVal|llVal|byref|union" \
+  "$OUT/inspect"/B002_*.txt | head -n 120
+```
+
+---
+
+## 3) Inspect direct de la fonction “FUN_180107f28” (si c’est l’entrée)
+
+Dans ton report, il parle de `FUN_180107f28`. Ça correspond généralement à **l’adresse 0x180107f28**.
+
+```bash
+"$GHIDRA_HOME/support/analyzeHeadless" \
+  "$PROJ" "$NAME" \
+  -process "$(basename "$BIN")" \
+  -noanalysis \
+  -scriptPath "$TC_HOME/scripts" \
+  -postScript inspect_address.py 0x180107f28 \
+  > "$OUT/inspect/FUN_180107f28.txt" 2>&1
+
+sed -n '1,220p' "$OUT/inspect/FUN_180107f28.txt"
+```
+
+---
+
+## 4) Identifier “qui est” la vtable 0x1801bba90 via rtti.json
+
+Tu veux associer **vtable → classe + méthodes**.
+
+```bash
+VT="0x1801bba90"
+
+jq -r --arg VT "$VT" '
+  .vtables[]
+  | select(.address==$VT)
+  | {address, class, offset_in_object, entry_count, first_entries: (.entries[0:25])}
+' "$OUT/rtti.json"
+```
+
+Si ça ne ressort rien (parfois format/leading zeros), essaye en “contains” :
+
+```bash
+jq -r '
+  .vtables[]
+  | select(.address|ascii_downcase|contains("1801bba90"))
+  | {address, class, offset_in_object, entry_count}
+' "$OUT/rtti.json"
+```
+
+---
+
+## 5) Trouver toutes les xrefs vers cette vtable (ultra utile)
+
+Crée un mini script Ghidra headless `xrefs_to.py` (1 fois), puis tu l’appelles pour 0x1801bba90.
+
+### Script `xrefs_to.py`
+
+```bash
+cat > "$TC_HOME/scripts/xrefs_to.py" << 'PY'
+# xrefs_to.py
+# @category TypeConfusion
+# @description Print XRefs to an address (data/code) with containing function
+# Usage: -postScript xrefs_to.py 0x1801bba90
+
+def main():
+    args = getScriptArgs()
+    if not args:
+        print("Usage: -postScript xrefs_to.py <hex_address>")
+        return
+
+    addr_str = args[0]
+    target = int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+
+    fm = currentProgram.getFunctionManager()
+    rm = currentProgram.getReferenceManager()
+    space = currentProgram.getAddressFactory().getDefaultAddressSpace()
+    a = space.getAddress(target)
+
+    print("XREFS TO: {}".format(a))
+    refs = rm.getReferencesTo(a)
+
+    count = 0
+    for r in refs:
+        count += 1
+        fa = r.getFromAddress()
+        f = fm.getFunctionContaining(fa)
+        fn = f.getName() if f else "N/A"
+        print("  {}  from {}  in {}  type={}".format(count, fa, fn, r.getReferenceType()))
+        if count >= 200:
+            print("  ... truncated")
+            break
+
+main()
+PY
+```
+
+### Appel pour la vtable
+
+```bash
+"$GHIDRA_HOME/support/analyzeHeadless" \
+  "$PROJ" "$NAME" \
+  -process "$(basename "$BIN")" \
+  -noanalysis \
+  -scriptPath "$TC_HOME/scripts" \
+  -postScript xrefs_to.py 0x1801bba90 \
+  > "$OUT/inspect/xrefs_vtable_1801bba90.txt" 2>&1
+
+sed -n '1,200p' "$OUT/inspect/xrefs_vtable_1801bba90.txt"
+```
+
+---
+
+## 6) B005 (COM) : est-ce que IID/CLSID sont contrôlables ?
+
+Même méthode : inspect les 5 sites puis grep.
 
 ```bash
 jq -r '
   .findings[]
-  | select(((.pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
+  | select(((.code // .pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
   | .address
 ' "$OUT/findings.json" \
 | while read -r ADDR; do
-    echo "[*] Inspect $ADDR"
+    echo "[*] Inspect B005 at $ADDR"
     "$GHIDRA_HOME/support/analyzeHeadless" \
       "$PROJ" "$NAME" \
       -process "$(basename "$BIN")" \
@@ -103,69 +207,30 @@ jq -r '
       -postScript inspect_address.py "$ADDR" \
       > "$OUT/inspect/B005_${ADDR//:/_}.txt" 2>&1
   done
+
+grep -nEi "CoCreateInstance|CoGetClassObject|IID|CLSID|GUID|hresult|SUCCEEDED|FAILED|QueryInterface" \
+  "$OUT/inspect"/B005_*.txt | head -n 200
 ```
+
+**Ce que tu veux voir :**
+
+* `rclsid` / `riid` = constantes (OK, moins intéressant)
+* ou dérivent d’un buffer / param / property (🔥)
 
 ---
 
-## 5) Comment décider “P1 exploitable” en 2 minutes par fichier
+# Ordre “comme un chef de projet” (ce que tu fais maintenant)
 
-### Pour **B002 PropVariant**
-
-Dans chaque `B002_*.txt`, cherche :
-
-* est-ce que le code **lit un champ union** (`pwszVal`, `bstrVal`, `ulVal`, `punkVal`, etc.) ?
-* est-ce qu’il y a un check clair du tag (`vt`) **juste avant** ?
-* est-ce que ça vient d’un flux externe (property store, metadata, parsing) ?
-
-Commande pour repérer vite :
-
-```bash
-grep -nEi "vt|V_VT|PropVariant|pwsz|bstr|punk|ulVal|llVal" "$OUT/inspect"/B002_*.txt | head -n 80
-```
-
-### Pour **B005 COM**
-
-Tu cherches :
-
-* CLSID/IID d’où ils viennent (constants vs input)
-* HRESULT checké ?
-* usage du pointeur retourné : cast/virtual call juste après ?
-
-```bash
-grep -nEi "CoCreateInstance|CoGetClassObject|CLSID|IID|hresult|SUCCEEDED|FAILED|QueryInterface" \
-  "$OUT/inspect"/B005_*.txt | head -n 120
-```
+1. **B002** : ouvre un `B002_*.txt` et repère si `vt` est checké avant d’utiliser l’union
+2. **FUN_180107f28** : comprends le flux (d’où vient le PROPVARIANT)
+3. **vtable 0x1801bba90** : map RTTI + xrefs (ça te donne les “consommateurs” principaux)
+4. **B005** : vérifie si IID/CLSID viennent d’ailleurs que des constantes
 
 ---
 
-## 6) Et A001 (189) ? (comment le rendre utile sans te noyer)
+Si tu veux qu’on avance “en mode review”, colle ici **le contenu de** :
 
-A001 en masse = normal sur une DLL C++.
+* `OUT/inspect/B002_....txt` (au moins la section *DECOMPILED CODE* + 30 lignes),
+  ou même juste `grep -n "DECOMPILED" -n` + le bloc autour,
 
-Ce que tu veux faire :
-
-* **cluster par fonction** → tu priorises les fonctions qui ont 5–20 occurrences (souvent des dispatchers), puis tu regardes celles où l’objet vient de parsing.
-
-Exemple (si tes champs le permettent) :
-
-```bash
-jq -r '
-  .findings[]
-  | select(((.pattern // .category // .id // "")|tostring|test("A001|Virtual dispatch";"i")))
-  | (.function // "unknown")
-' "$OUT/findings.json" | sort | uniq -c | sort -nr | head -n 30
-```
-
----
-
-## Ce que je te propose maintenant
-
-Ouvre juste **un** des fichiers générés :
-
-* `output/dcomp_final1/inspect/B002_....txt`
-
-Copie/colle ici le bloc **DECOMPILED CODE** + 20 lignes autour (ou colle le fichier entier si tu veux), et je te fais la lecture “review vuln” :
-
-* où est l’input,
-* quel check manque,
-* quelle hypothèse de type confusion tester en premier.
+et je te dis **si c’est P1/P2/bruit** et exactement quoi tracer ensuite (caller chain, vt-check, etc.).
