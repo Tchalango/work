@@ -1,236 +1,256 @@
-Parfait — ton triage est exactement ce que tu veux voir : **B002 (2 hits)** sort du lot, **B005 (5 hits)** ensuite, et **A001** sert surtout à “pointer les zones OO chaudes” (vtable 0x1801bba90).
+Parfait — ton triage est **cohérent** et surtout il met en évidence **où ton framework doit être plus strict** :
 
-Je te donne maintenant **les commandes concrètes** pour passer en “vraie analyse” (headless, tunnel) sur ces 3 axes.
+* **A001 “vtable hot”** → faux positif confirmé (pointeur sur `WindowsDeleteString`, pas une vtable).
+* **B005 CoCreateInstance** → CLSID/IID hardcodés ⇒ souvent “moins intéressant”, MAIS ça mérite quand même un check “activation sûre”.
+* **B002** → **seul vrai candidat** : `FUN_180107f28` fait une boucle de parsing avec `PROPVARIANT` sur la stack.
+
+Je te donne **les next steps dev** + **les commandes** pour transformer ça en “analyse réelle”.
 
 ---
 
-## 0) Variables (copie-colle)
+# 1) Corriger A001 : ne compter comme “virtual call/vtable” que si c’est une **vftable MSVC valide**
 
-Adapte juste si ton path est différent.
+Ton bug actuel : tu traites “table de pointeurs / func pointer” comme “vtable”.
+
+### Test robuste (MSVC x64)
+
+Si un objet a `vptr = P`, alors **P doit pointer vers une table de code pointers**, et surtout **`*(P-8)` doit être un Complete Object Locator (COL)** en `.rdata` (signature 1 + self_rva sanity).
+
+➡️ Donc tu ajoutes une validation :
+
+* P dans `.rdata`
+* `*(P)` dans `.text` (au moins 1 entrée code)
+* `col = *(P-8)` dans `.rdata`
+* `*(col) == 1` et `self_rva == col - image_base`
+
+### Patch conceptuel (à intégrer dans ton détecteur A001)
+
+```python
+def is_msvc_vftable(self, p):
+    if not self.is_valid_rdata_ptr(p): return False
+
+    first = self.read_u64(p)
+    if not first or not self.is_valid_code_ptr(first): return False
+
+    col = self.read_u64(p - 8)
+    if not col or not self.is_valid_rdata_ptr(col): return False
+
+    sig = self.read_u32(col)
+    if sig != 1: return False
+
+    self_rva = self.read_u32(col + 20)
+    if self_rva is None: return False
+
+    expected = (col - self.image_base) & 0xFFFFFFFF
+    return self_rva == expected
+```
+
+✅ Résultat attendu : **A001 chute drastiquement** et tu ne te fais plus piéger par `WindowsDeleteString`, jump tables, callback tables, etc.
+
+---
+
+# 2) B005 “hardcoded CLSID/IID” : le vrai check à faire (sans tomber dans le bruit)
+
+Même hardcodé, il reste un angle “sécurité” : **est-ce que l’activation COM peut charger un composant inattendu** (typiquement via registry resolution) ?
+
+Sans faire de “how-to hijack”, ton triage “faible risque” est OK si :
+
+* le CLSID est **Microsoft connu**
+* le contexte est **in-proc système attendu**
+* il y a une vérif (HRESULT + interface obtenue)
+
+### Commande “sanity” : inspect les 5 callsites et check HRESULT / IID
+
+Tu l’as déjà en partie, mais pour être carré :
+
+```bash
+OUT="/home/PC/type_confusing/output/dcomp_final1"
+grep -RniE "CoCreateInstance|CoGetClassObject|QueryInterface|SUCCEEDED|FAILED|HRESULT" "$OUT/inspect"/B005_*.txt | head -n 200
+```
+
+✅ Résultat attendu : tu confirmes “hardcoded + checks corrects” ⇒ **dépriorisé**.
+
+---
+
+# 3) B002 : passer de “ça parse un buffer interne” à “voici le chemin d’entrée”
+
+Tu veux **remonter la chaîne d’appels** jusqu’à un export / un handler / un entrypoint logique.
+
+## 3.1 — Xrefs callers de `FUN_180107f28` (commande)
+
+Tu as l’adresse `0x180107f28`. Fais un script headless “callers tree”.
+
+### Script `callers_tree.py` (copie-colle)
 
 ```bash
 TC_HOME="/home/PC/type_confusing"
-OUT="$TC_HOME/output/dcomp_final1"
-BIN="/mnt/c/Windows/System32/dcomp.dll"
-
-# Trouver automatiquement le projet Ghidra utilisé
-PROJ="$(ls -d "$TC_HOME"/projects/*dcomp* 2>/dev/null | head -n 1)"
-NAME="dcomp"
-
-echo "PROJ=$PROJ"
-ls -la "$OUT"
-```
-
-> Si `PROJ` est vide, liste tes projets : `ls -la $TC_HOME/projects`
-
----
-
-## 1) Extraire les 2 adresses B002 + les 5 B005 depuis findings.json
-
-Ton résumé montre “B002 / B005”, donc on filtre large (code/pattern/category).
-
-```bash
-# B002
-jq -r '
-  .findings[]
-  | select(((.code // .pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
-  | .address
-' "$OUT/findings.json" | nl
-
-# B005
-jq -r '
-  .findings[]
-  | select(((.code // .pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
-  | .address
-' "$OUT/findings.json" | nl
-```
-
----
-
-## 2) Inspect automatique des sites B002 (priorité #1)
-
-Ça te sort des fichiers texte avec **décompilation + instructions**.
-
-```bash
-mkdir -p "$OUT/inspect"
-
-jq -r '
-  .findings[]
-  | select(((.code // .pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
-  | .address
-' "$OUT/findings.json" \
-| while read -r ADDR; do
-    echo "[*] Inspect B002 at $ADDR"
-    "$GHIDRA_HOME/support/analyzeHeadless" \
-      "$PROJ" "$NAME" \
-      -process "$(basename "$BIN")" \
-      -noanalysis \
-      -scriptPath "$TC_HOME/scripts" \
-      -postScript inspect_address.py "$ADDR" \
-      > "$OUT/inspect/B002_${ADDR//:/_}.txt" 2>&1
-  done
-
-ls -ლა "$OUT/inspect"/B002_*.txt
-```
-
-### Lecture rapide “est-ce chaud ?”
-
-```bash
-grep -nEi "vt|V_VT|PropVariant|pwsz|bstr|punk|ulVal|llVal|byref|union" \
-  "$OUT/inspect"/B002_*.txt | head -n 120
-```
-
----
-
-## 3) Inspect direct de la fonction “FUN_180107f28” (si c’est l’entrée)
-
-Dans ton report, il parle de `FUN_180107f28`. Ça correspond généralement à **l’adresse 0x180107f28**.
-
-```bash
-"$GHIDRA_HOME/support/analyzeHeadless" \
-  "$PROJ" "$NAME" \
-  -process "$(basename "$BIN")" \
-  -noanalysis \
-  -scriptPath "$TC_HOME/scripts" \
-  -postScript inspect_address.py 0x180107f28 \
-  > "$OUT/inspect/FUN_180107f28.txt" 2>&1
-
-sed -n '1,220p' "$OUT/inspect/FUN_180107f28.txt"
-```
-
----
-
-## 4) Identifier “qui est” la vtable 0x1801bba90 via rtti.json
-
-Tu veux associer **vtable → classe + méthodes**.
-
-```bash
-VT="0x1801bba90"
-
-jq -r --arg VT "$VT" '
-  .vtables[]
-  | select(.address==$VT)
-  | {address, class, offset_in_object, entry_count, first_entries: (.entries[0:25])}
-' "$OUT/rtti.json"
-```
-
-Si ça ne ressort rien (parfois format/leading zeros), essaye en “contains” :
-
-```bash
-jq -r '
-  .vtables[]
-  | select(.address|ascii_downcase|contains("1801bba90"))
-  | {address, class, offset_in_object, entry_count}
-' "$OUT/rtti.json"
-```
-
----
-
-## 5) Trouver toutes les xrefs vers cette vtable (ultra utile)
-
-Crée un mini script Ghidra headless `xrefs_to.py` (1 fois), puis tu l’appelles pour 0x1801bba90.
-
-### Script `xrefs_to.py`
-
-```bash
-cat > "$TC_HOME/scripts/xrefs_to.py" << 'PY'
-# xrefs_to.py
+cat > "$TC_HOME/scripts/callers_tree.py" << 'PY'
+# callers_tree.py
 # @category TypeConfusion
-# @description Print XRefs to an address (data/code) with containing function
-# Usage: -postScript xrefs_to.py 0x1801bba90
+# @description Print callers tree to a function entry
+# Usage: -postScript callers_tree.py 0x180107f28 3
+
+from collections import deque
 
 def main():
     args = getScriptArgs()
     if not args:
-        print("Usage: -postScript xrefs_to.py <hex_address>")
+        print("Usage: callers_tree.py <hex_addr> [depth]")
         return
 
-    addr_str = args[0]
-    target = int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+    target = int(args[0], 16) if args[0].startswith("0x") else int(args[0])
+    max_depth = int(args[1]) if len(args) > 1 else 3
 
     fm = currentProgram.getFunctionManager()
     rm = currentProgram.getReferenceManager()
     space = currentProgram.getAddressFactory().getDefaultAddressSpace()
-    a = space.getAddress(target)
 
-    print("XREFS TO: {}".format(a))
-    refs = rm.getReferencesTo(a)
+    tgt = space.getAddress(target)
+    tgt_func = fm.getFunctionAt(tgt) or fm.getFunctionContaining(tgt)
+    if not tgt_func:
+        print("No function at/containing {}".format(tgt))
+        return
 
-    count = 0
-    for r in refs:
-        count += 1
-        fa = r.getFromAddress()
-        f = fm.getFunctionContaining(fa)
-        fn = f.getName() if f else "N/A"
-        print("  {}  from {}  in {}  type={}".format(count, fa, fn, r.getReferenceType()))
-        if count >= 200:
-            print("  ... truncated")
-            break
+    print("TARGET: {}  entry={}".format(tgt_func.getName(), tgt_func.getEntryPoint()))
+
+    seen = set()
+    q = deque()
+    q.append((tgt_func.getEntryPoint(), 0))
+
+    while q:
+        fentry, depth = q.popleft()
+        if depth >= max_depth:
+            continue
+
+        refs = rm.getReferencesTo(fentry)
+        callers = set()
+
+        for r in refs:
+            if not r.getReferenceType().isCall():
+                continue
+            fa = r.getFromAddress()
+            cf = fm.getFunctionContaining(fa)
+            if cf:
+                callers.add(cf)
+
+        for cf in sorted(callers, key=lambda x: str(x.getEntryPoint())):
+            key = (cf.getEntryPoint().toString(), depth)
+            if key in seen:
+                continue
+            seen.add(key)
+            indent = "  " * (depth + 1)
+            print("{}<- {}  entry={}".format(indent, cf.getName(), cf.getEntryPoint()))
+            q.append((cf.getEntryPoint(), depth + 1))
 
 main()
 PY
 ```
 
-### Appel pour la vtable
+### Lancer le callers tree
 
 ```bash
+TC_HOME="/home/PC/type_confusing"
+OUT="$TC_HOME/output/dcomp_final1"
+BIN="/mnt/c/Windows/System32/dcomp.dll"
+PROJ="$(ls -d "$TC_HOME"/projects/*dcomp* 2>/dev/null | head -n 1)"
+NAME="dcomp"
+
 "$GHIDRA_HOME/support/analyzeHeadless" \
   "$PROJ" "$NAME" \
   -process "$(basename "$BIN")" \
   -noanalysis \
   -scriptPath "$TC_HOME/scripts" \
-  -postScript xrefs_to.py 0x1801bba90 \
-  > "$OUT/inspect/xrefs_vtable_1801bba90.txt" 2>&1
+  -postScript callers_tree.py 0x180107f28 4 \
+  > "$OUT/inspect/callers_FUN_180107f28.txt" 2>&1
 
-sed -n '1,200p' "$OUT/inspect/xrefs_vtable_1801bba90.txt"
+sed -n '1,160p' "$OUT/inspect/callers_FUN_180107f28.txt"
 ```
+
+✅ Résultat attendu : une **liste de fonctions “au-dessus”**.
+L’objectif c’est de tomber sur un truc du style :
+
+* handler de commande / decode message / property store / “LoadFrom…” / etc.
 
 ---
 
-## 6) B005 (COM) : est-ce que IID/CLSID sont contrôlables ?
+## 3.2 — Trouver la source du “buffer interne”
 
-Même méthode : inspect les 5 sites puis grep.
+Une fois que tu as les callers, inspect **le premier caller** au-dessus (souvent c’est là que le buffer est créé/fetch).
+
+Commande : (remplace `0x...` par l’adresse d’un caller que tu vois dans le fichier)
 
 ```bash
-jq -r '
-  .findings[]
-  | select(((.code // .pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
-  | .address
-' "$OUT/findings.json" \
-| while read -r ADDR; do
-    echo "[*] Inspect B005 at $ADDR"
-    "$GHIDRA_HOME/support/analyzeHeadless" \
-      "$PROJ" "$NAME" \
-      -process "$(basename "$BIN")" \
-      -noanalysis \
-      -scriptPath "$TC_HOME/scripts" \
-      -postScript inspect_address.py "$ADDR" \
-      > "$OUT/inspect/B005_${ADDR//:/_}.txt" 2>&1
-  done
+ADDR="0x18010XXXX"
+"$GHIDRA_HOME/support/analyzeHeadless" \
+  "$PROJ" "$NAME" \
+  -process "$(basename "$BIN")" \
+  -noanalysis \
+  -scriptPath "$TC_HOME/scripts" \
+  -postScript inspect_address.py "$ADDR" \
+  > "$OUT/inspect/inspect_${ADDR}.txt" 2>&1
 
-grep -nEi "CoCreateInstance|CoGetClassObject|IID|CLSID|GUID|hresult|SUCCEEDED|FAILED|QueryInterface" \
-  "$OUT/inspect"/B005_*.txt | head -n 200
+grep -nEi "memcpy|RtlCopyMemory|memmove|ReadFile|Stream|Get.*Property|buffer|size|length|parse|decode" \
+  "$OUT/inspect/inspect_${ADDR}.txt" | head -n 200
 ```
 
-**Ce que tu veux voir :**
+✅ Résultat attendu : tu identifies **d’où vient** le buffer :
 
-* `rclsid` / `riid` = constantes (OK, moins intéressant)
-* ou dérivent d’un buffer / param / property (🔥)
-
----
-
-# Ordre “comme un chef de projet” (ce que tu fais maintenant)
-
-1. **B002** : ouvre un `B002_*.txt` et repère si `vt` est checké avant d’utiliser l’union
-2. **FUN_180107f28** : comprends le flux (d’où vient le PROPVARIANT)
-3. **vtable 0x1801bba90** : map RTTI + xrefs (ça te donne les “consommateurs” principaux)
-4. **B005** : vérifie si IID/CLSID viennent d’ailleurs que des constantes
+* paramètre d’une API ?
+* data structure globale ?
+* résultat d’un “get property / stream read” ?
 
 ---
 
-Si tu veux qu’on avance “en mode review”, colle ici **le contenu de** :
+# 4) B002 : check “type confusion” côté PROPVARIANT (vrai triage)
 
-* `OUT/inspect/B002_....txt` (au moins la section *DECOMPILED CODE* + 30 lignes),
-  ou même juste `grep -n "DECOMPILED" -n` + le bloc autour,
+Dans `FUN_180107f28`, tu veux répondre à 3 questions :
 
-et je te dis **si c’est P1/P2/bruit** et exactement quoi tracer ensuite (caller chain, vt-check, etc.).
+1. **Le `vt` est-il contrôlé (directement ou indirectement) par le buffer ?**
+2. **Le code lit-il l’union sans check strict du `vt` ?**
+3. **Y a-t-il des chemins d’erreur qui appellent Clear/Copy mais laissent un état incohérent ?**
+
+### Grep rapide dans l’inspect
+
+```bash
+OUT="/home/PC/type_confusing/output/dcomp_final1"
+grep -nEi "PROPVARIANT|PropVariant|vt|V_VT|switch|case|union|bstr|pwsz|punk|byref" \
+  "$OUT/inspect/FUN_180107f28.txt" | head -n 200
+```
+
+✅ Résultat attendu :
+
+* soit tu vois un `switch(vt)` propre (plutôt safe)
+* soit tu vois des accès `pv->xxx` sans guard (ça devient P1)
+
+---
+
+# 5) Ton RTTI “COL->vtable link pas fait” : normal… et fixable
+
+`dcomp.dll` peut avoir RTTI partiel / patterns compliqués / xrefs pas propres.
+
+Le fix “qui marche bien” : **scanner les vftables en partant des tables**, pas des COLs :
+
+* pour chaque adresse `A` en `.rdata` alignée 8 :
+
+  * si `*(A)` pointe dans `.text`
+  * et `*(A-8)` ressemble à un COL valide
+  * alors `A` est une vftable (et tu récupères la classe via le COL)
+
+Ça va aussi **éliminer** des faux positifs.
+
+---
+
+# Ce que je te conseille maintenant (ordre optimal)
+
+1. **Implémente la validation vftable MSVC** → A001 clean (gros gain qualité)
+2. **Callers tree** sur `0x180107f28` → tu trouves le “point d’entrée”
+3. Inspect le caller + grep “source buffer” → tu sais si c’est atteignable
+4. Si atteignable : tu raffines B002 en “P1/P2” avec check `vt` + union access
+
+---
+
+Si tu peux, colle ici juste le contenu de :
+
+* `output/dcomp_final1/inspect/callers_FUN_180107f28.txt` (les 30–60 premières lignes)
+
+Je te dis **exactement** lequel des callers inspect en premier et quoi chercher dedans pour trouver l’entrée (sans te faire perdre du temps).
