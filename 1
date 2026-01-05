@@ -1,1 +1,1358 @@
-créer un repertoire "type confusing"
+Parfait. Je te donne **un “drop-in” patch complet** (scripts + wrapper) qui corrige les derniers points faibles :
+
+* **Imports Windows (IAT / _*imp* / thunks)** → B1/B2/B3/B7 deviennent fiables
+* **A2** → passe en mode **2-pass** (candidates → decompile) pour éviter le “décompile tout”
+* **A11** → détection **Pcode** (vtable index non constant) + fallback disasm
+* **Robustesse** → fallback `-process`, dédup, ranking, mode `--fast/--full`, skip reimport
+
+Ensuite je te donne un **plan chef de projet** : TODOs + résultats attendus + critères d’acceptation.
+
+---
+
+# 1) Livrable : scripts corrigés (v1.2 “stable & scalable”)
+
+## 1.1 `~/type_confusion/scripts/extract_rtti.py` (mise à jour)
+
+✅ Changements clés :
+
+* sections : accepte `.rdata`/`.text` “variants” (regex)
+* vtables via refs (si dispo) + **fallback scan global** (pas juste ±0x100)
+* support vtables multiples (MI) propre
+* output paramétrable (déjà OK)
+
+```python
+# extract_rtti.py
+# @category TypeConfusion
+# @description Extract RTTI and VTables from MSVC x64 binary (Jython 2.7 compatible)
+
+import json
+import re
+
+class RTTIExtractor:
+    def __init__(self):
+        self.program = currentProgram
+        self.memory = self.program.getMemory()
+        self.listing = self.program.getListing()
+        self.ref_mgr = self.program.getReferenceManager()
+        self.space = self.program.getAddressFactory().getDefaultAddressSpace()
+        self.image_base = self.program.getImageBase().getOffset()
+
+        self.vtables = []
+        self.classes = {}
+        self.warnings = []
+        self.col_cache = {}
+
+        self.rdata_start = None
+        self.rdata_end = None
+        self.text_start = None
+        self.text_end = None
+        self._init_sections()
+
+    def _init_sections(self):
+        # Accepte variantes (.text$mn, .rdata$something, etc.)
+        rdata_re = re.compile(r'^\.rdata(\$.*)?$')
+        text_re  = re.compile(r'^\.text(\$.*)?$')
+
+        for block in self.memory.getBlocks():
+            name = block.getName()
+            if self.rdata_start is None and (name == ".rdata" or rdata_re.match(name)):
+                self.rdata_start = block.getStart().getOffset()
+                self.rdata_end = block.getEnd().getOffset()
+            if self.text_start is None and (name == ".text" or text_re.match(name)):
+                self.text_start = block.getStart().getOffset()
+                self.text_end = block.getEnd().getOffset()
+
+        # Fallback : si pas trouvé, prendre "executable" comme .text
+        if self.text_start is None:
+            for block in self.memory.getBlocks():
+                if block.isExecute():
+                    self.text_start = block.getStart().getOffset()
+                    self.text_end = block.getEnd().getOffset()
+                    break
+
+    def read_u32(self, addr):
+        try:
+            return self.memory.getInt(self.space.getAddress(addr)) & 0xFFFFFFFF
+        except:
+            return None
+
+    def read_u64(self, addr):
+        try:
+            return self.memory.getLong(self.space.getAddress(addr)) & 0xFFFFFFFFFFFFFFFF
+        except:
+            return None
+
+    def read_string(self, addr):
+        s = ""
+        try:
+            a = self.space.getAddress(addr)
+            while len(s) < 512:
+                b = self.memory.getByte(a) & 0xFF
+                if b == 0:
+                    break
+                s += chr(b)
+                a = a.add(1)
+        except:
+            pass
+        return s
+
+    def demangle(self, name):
+        if not name:
+            return "UNKNOWN"
+        m = re.match(r'\.?\?A([VU])(.+?)@@$', name)
+        if m:
+            parts = m.group(2).split('@')
+            parts = [p for p in reversed(parts) if p]
+            return "::".join(parts)
+        return name
+
+    def is_valid_code_ptr(self, addr):
+        return self.text_start is not None and self.text_start <= addr <= self.text_end
+
+    def is_valid_rdata_ptr(self, addr):
+        return self.rdata_start is not None and self.rdata_start <= addr <= self.rdata_end
+
+    def parse_type_descriptor(self, addr):
+        mangled = self.read_string(addr + 0x10)
+        if not mangled or not mangled.startswith(".?A"):
+            return None
+        return {"address": hex(addr), "mangled": mangled, "demangled": self.demangle(mangled)}
+
+    def parse_class_hierarchy(self, addr):
+        attributes = self.read_u32(addr + 4)
+        num_bases = self.read_u32(addr + 8)
+        base_array_rva = self.read_u32(addr + 12)
+
+        if attributes is None or num_bases is None:
+            return {"flags": [], "bases": []}
+
+        flags = []
+        if attributes & 0x01:
+            flags.append("MULTIPLE_INHERITANCE")
+        if attributes & 0x02:
+            flags.append("VIRTUAL_INHERITANCE")
+        if attributes & 0x04:
+            flags.append("AMBIGUOUS")
+
+        bases = []
+        if num_bases and num_bases < 80 and base_array_rva:
+            base_array_addr = self.image_base + base_array_rva
+            for i in range(num_bases):
+                bcd_rva = self.read_u32(base_array_addr + i * 4)
+                if not bcd_rva:
+                    continue
+                bcd_addr = self.image_base + bcd_rva
+                td_rva = self.read_u32(bcd_addr + 0)
+                if not td_rva:
+                    continue
+                td = self.parse_type_descriptor(self.image_base + td_rva)
+                if not td:
+                    continue
+
+                mdisp = self.read_u32(bcd_addr + 8)
+                pdisp = self.read_u32(bcd_addr + 12)
+
+                bases.append({
+                    "name": td["demangled"],
+                    "is_virtual": (pdisp is not None and pdisp != 0xFFFFFFFF),
+                    "offset": mdisp if mdisp is not None else 0
+                })
+
+        return {"flags": flags, "bases": bases}
+
+    def parse_col(self, addr):
+        if addr in self.col_cache:
+            return self.col_cache[addr]
+
+        sig = self.read_u32(addr)
+        if sig != 1:
+            return None
+
+        self_rva = self.read_u32(addr + 20)
+        expected = addr - self.image_base
+        if self_rva is None or self_rva != expected:
+            return None
+
+        td_rva = self.read_u32(addr + 12)
+        chd_rva = self.read_u32(addr + 16)
+        offset_in_obj = self.read_u32(addr + 4)
+
+        if td_rva is None or chd_rva is None:
+            return None
+
+        td = self.parse_type_descriptor(self.image_base + td_rva)
+        if not td:
+            return None
+
+        chd = self.parse_class_hierarchy(self.image_base + chd_rva)
+
+        col = {
+            "col_addr": hex(addr),
+            "class_name": td["demangled"],
+            "offset_in_object": offset_in_obj if offset_in_obj is not None else 0,
+            "hierarchy": chd
+        }
+        self.col_cache[addr] = col
+        return col
+
+    def looks_like_vtable(self, addr):
+        # Exige 2 entrées valides si possible (moins de bruit)
+        ok = 0
+        for i in range(10):
+            p = self.read_u64(addr + i * 8)
+            if p and self.is_valid_code_ptr(p):
+                ok += 1
+            else:
+                break
+        return ok >= 2 or (ok >= 1 and i <= 2)
+
+    def extract_vtable_entries(self, vtable_addr):
+        entries = []
+        off = 0
+        while off < 0x1000:
+            p = self.read_u64(vtable_addr + off)
+            if not p or not self.is_valid_code_ptr(p):
+                break
+            func = self.listing.getFunctionAt(self.space.getAddress(p))
+            entries.append({
+                "index": off // 8,
+                "address": hex(p),
+                "name": func.getName() if func else "sub_{:x}".format(p)
+            })
+            off += 8
+        return entries
+
+    def _register_vtable(self, vtable_addr, col):
+        addr_hex = hex(vtable_addr)
+        for vt in self.vtables:
+            if vt.get("address") == addr_hex:
+                return
+
+        entries = self.extract_vtable_entries(vtable_addr)
+        vt_info = {
+            "address": addr_hex,
+            "class": col["class_name"],
+            "offset_in_object": col["offset_in_object"],
+            "entry_count": len(entries),
+            "entries": entries,
+            "hierarchy": col["hierarchy"]
+        }
+        self.vtables.append(vt_info)
+
+        cname = col["class_name"]
+        if cname not in self.classes:
+            bases = col["hierarchy"].get("bases", [])
+            base_names = []
+            # base[0] est souvent "self" en MSVC, skip si présent
+            if bases and len(bases) >= 2:
+                for b in bases[1:]:
+                    base_names.append(b.get("name", "UNKNOWN"))
+            self.classes[cname] = {
+                "vtables": [],
+                "flags": col["hierarchy"].get("flags", []),
+                "bases": base_names
+            }
+        self.classes[cname]["vtables"].append(addr_hex)
+
+        flags = col["hierarchy"].get("flags", [])
+        if "MULTIPLE_INHERITANCE" in flags:
+            self.warnings.append({"type": "MULTIPLE_INHERITANCE", "class": cname, "vtable": addr_hex, "risk": "HIGH"})
+        if "VIRTUAL_INHERITANCE" in flags:
+            self.warnings.append({"type": "VIRTUAL_INHERITANCE", "class": cname, "vtable": addr_hex, "risk": "HIGH"})
+
+        print("  [+] {} @ {} ({} methods, offset={})".format(
+            cname, addr_hex, len(entries), col["offset_in_object"]))
+
+    def _find_col_candidates(self):
+        if self.rdata_start is None:
+            return []
+        cols = []
+        addr = self.rdata_start
+        scanned = 0
+        while addr < self.rdata_end - 0x20:
+            sig = self.read_u32(addr)
+            if sig == 1:
+                self_rva = self.read_u32(addr + 20)
+                expected = addr - self.image_base
+                if self_rva is not None and self_rva == expected:
+                    cols.append(addr)
+            addr += 4
+            scanned += 1
+            if scanned % 200000 == 0:
+                print("  ... scanned {} dwords".format(scanned))
+        return cols
+
+    def _vtables_from_refs(self, col_addr):
+        colA = self.space.getAddress(col_addr)
+        refs = self.ref_mgr.getReferencesTo(colA)
+        hits = []
+        for ref in refs:
+            frm = ref.getFromAddress().getOffset()
+            if self.is_valid_rdata_ptr(frm):
+                vt = frm + 8
+                if self.looks_like_vtable(vt):
+                    hits.append(vt)
+        return hits
+
+    def _vtables_from_global_scan(self, col_addr):
+        # fallback global: scan rdata pour ptr==col_addr, plus lent mais récupère beaucoup
+        hits = []
+        if self.rdata_start is None:
+            return hits
+        addr = self.rdata_start
+        while addr < self.rdata_end - 8:
+            p = self.read_u64(addr)
+            if p == col_addr:
+                vt = addr + 8
+                if self.looks_like_vtable(vt):
+                    hits.append(vt)
+            addr += 8
+        return hits
+
+    def scan(self):
+        print("=" * 60)
+        print("RTTI EXTRACTOR - MSVC x64")
+        print("=" * 60)
+        print("Binary: {}".format(self.program.getName()))
+        print("Image base: {}".format(hex(self.image_base)))
+        print("")
+
+        if self.rdata_start is None:
+            print("[-] No .rdata-like block found. Abort.")
+            return
+
+        cols = self._find_col_candidates()
+        print("[*] Found {} potential COL structures".format(len(cols)))
+
+        # Phase A: refs (rapide)
+        print("[*] Phase A: vtables via xrefs...")
+        missed = 0
+        for col_addr in cols:
+            col = self.parse_col(col_addr)
+            if not col:
+                continue
+            vts = self._vtables_from_refs(col_addr)
+            if not vts:
+                missed += 1
+                continue
+            for vt in vts:
+                self._register_vtable(vt, col)
+
+        # Phase B: fallback global scan si trop de ratés
+        ratio_missed = float(missed) / float(len(cols)) if cols else 0.0
+        if ratio_missed > 0.35:
+            print("[*] Phase B: global scan fallback (miss ratio {:.2f})...".format(ratio_missed))
+            for col_addr in cols:
+                col = self.parse_col(col_addr)
+                if not col:
+                    continue
+                vts = self._vtables_from_global_scan(col_addr)
+                for vt in vts:
+                    self._register_vtable(vt, col)
+
+        print("[*] Found {} vtables, {} classes".format(len(self.vtables), len(self.classes)))
+
+    def export(self, path):
+        # dédup warnings
+        seen = set()
+        uniq = []
+        for w in self.warnings:
+            key = "{}:{}:{}".format(w.get("type"), w.get("class"), w.get("vtable"))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(w)
+
+        stats = {"total_classes": len(self.classes), "total_vtables": len(self.vtables), "multiple_inheritance": 0, "virtual_inheritance": 0}
+        for cname, c in self.classes.items():
+            flags = c.get("flags", [])
+            if "MULTIPLE_INHERITANCE" in flags:
+                stats["multiple_inheritance"] += 1
+            if "VIRTUAL_INHERITANCE" in flags:
+                stats["virtual_inheritance"] += 1
+
+        out = {
+            "binary": self.program.getName(),
+            "image_base": hex(self.image_base),
+            "classes": self.classes,
+            "vtables": self.vtables,
+            "warnings": uniq,
+            "stats": stats
+        }
+
+        with open(path, 'w') as f:
+            json.dump(out, f, indent=2)
+        print("[+] Exported to {}".format(path))
+
+
+args = getScriptArgs()
+out_path = args[0] if args else "/tmp/rtti_output.json"
+
+e = RTTIExtractor()
+e.scan()
+e.export(out_path)
+```
+
+---
+
+## 1.2 `~/type_confusion/scripts/detect_patterns.py` (gros patch)
+
+✅ Changements clés :
+
+* **Imports Windows robustes** : API → symbol candidates (`api`, `__imp_api`, namespaces externes) → IAT refs → thunk → callsites
+* **2-pass A2** : scan disasm pour fonctions avec calls indirects → decompile seulement celles-là
+* **A11 Pcode** : CALLIND dont l’adresse dépend d’un offset non-constant → CRITICAL
+* **dédup + ranking** : output propre et utile
+
+```python
+# detect_patterns.py
+# @category TypeConfusion
+# @description Detect type confusion patterns in binary (Jython 2.7 compatible)
+
+import json
+import re
+
+from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.pcode import PcodeOp
+
+class PatternDetector:
+    def __init__(self, fast_mode=False):
+        self.program = currentProgram
+        self.listing = self.program.getListing()
+        self.func_mgr = self.program.getFunctionManager()
+        self.ref_mgr = self.program.getReferenceManager()
+        self.sym_tbl = self.program.getSymbolTable()
+        self.space = self.program.getAddressFactory().getDefaultAddressSpace()
+
+        self.fast_mode = fast_mode
+        self.findings = []
+        self._seen = set()
+
+        self.decomp = None
+        if not self.fast_mode:
+            self.decomp = DecompInterface()
+            self.decomp.openProgram(self.program)
+
+        # APIs (Windows) à résoudre
+        self.APIS_QUERYINTERFACE = ["QueryInterface"]
+        self.APIS_PROPVARIANT = ["PropVariantCopy", "PropVariantClear", "PropVariantChangeType",
+                                "PropVariantToVariant", "InitPropVariantFromBuffer"]
+        self.APIS_SAFEARRAY = ["SafeArrayCreate", "SafeArrayCreateEx", "SafeArrayCreateVector",
+                               "SafeArrayGetElement", "SafeArrayPutElement", "SafeArrayAccessData",
+                               "SafeArrayCopy", "SafeArrayCopyData"]
+        self.APIS_VARIANT = ["VariantInit", "VariantClear", "VariantCopy", "VariantCopyInd",
+                             "VariantChangeType", "VariantChangeTypeEx"]
+
+        # dynamic_cast sites
+        self.dynamic_cast_sites = self._find_dynamic_cast_sites()
+        print("[*] Found {} __RTDynamicCast call sites".format(len(self.dynamic_cast_sites)))
+
+        # Map api -> callsites
+        self.api_calls = {}  # name -> list(Address)
+        self._build_api_call_map()
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _add_finding(self, finding):
+        # dédup sur (pattern,address)
+        key = "{}@{}".format(finding.get("pattern", "UNK"), finding.get("address", ""))
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.findings.append(finding)
+
+    def _addr_to_off(self, addr):
+        if hasattr(addr, 'getOffset'):
+            return addr.getOffset()
+        return int(addr)
+
+    def _has_nearby_dynamic_cast(self, addr, window=350):
+        a = self._addr_to_off(addr)
+        for dc in self.dynamic_cast_sites:
+            if dc < a and a - dc < window:
+                return True
+        return False
+
+    def _get_func_containing(self, addr):
+        if hasattr(addr, 'getOffset'):
+            return self.func_mgr.getFunctionContaining(addr)
+        return self.func_mgr.getFunctionContaining(self.space.getAddress(addr))
+
+    def _iter_symbols_by_name(self, name):
+        # SymbolTable.getSymbols(name) -> iterator
+        try:
+            it = self.sym_tbl.getSymbols(name)
+            if it:
+                for s in it:
+                    yield s
+        except:
+            return
+
+    def _symbol_name_variants(self, api):
+        # Variantes fréquentes
+        v = [api, "__imp_" + api, "_imp__" + api, "imp_" + api, "_" + api]
+        return v
+
+    def _collect_thunks_from_iat_symbol(self, sym_addr):
+        # Si sym_addr est __imp_API (data), on trouve souvent un thunk qui fait jmp [__imp_API]
+        thunks = set()
+        refs = self.ref_mgr.getReferencesTo(sym_addr)
+        for r in refs:
+            frm = r.getFromAddress()
+            f = self.func_mgr.getFunctionContaining(frm)
+            if f and f.isThunk():
+                thunks.add(f)
+        return thunks
+
+    def _collect_calls_to_addr(self, target_addr):
+        sites = set()
+        refs = self.ref_mgr.getReferencesTo(target_addr)
+        for r in refs:
+            if r.getReferenceType().isCall():
+                sites.add(r.getFromAddress())
+        return sites
+
+    def _collect_calls_to_thunk(self, thunk_func):
+        sites = set()
+        entry = thunk_func.getEntryPoint()
+        refs = self.ref_mgr.getReferencesTo(entry)
+        for r in refs:
+            if r.getReferenceType().isCall():
+                sites.add(r.getFromAddress())
+        return sites
+
+    def _collect_calls_for_api(self, api):
+        sites = set()
+
+        # 1) Direct symbols (api, __imp_api, etc.)
+        for name in self._symbol_name_variants(api):
+            for sym in self._iter_symbols_by_name(name):
+                addr = sym.getAddress()
+
+                # calls directly to symbol address
+                sites |= self._collect_calls_to_addr(addr)
+
+                # thunks referencing __imp_*
+                thunks = self._collect_thunks_from_iat_symbol(addr)
+                for t in thunks:
+                    sites |= self._collect_calls_to_thunk(t)
+
+        # 2) Thunks / stubs dont le nom contient api (souvent Ghidra nomme les stubs)
+        # (limité à ce set d'APIs -> coût OK)
+        for f in self.func_mgr.getFunctions(True):
+            n = f.getName()
+            if api == n or (api in n and f.isThunk()):
+                sites |= self._collect_calls_to_thunk(f)
+
+        # 3) External functions (namespace DLL::api). On essaye d'attraper le thunk si Ghidra l'a lié.
+        for ext in self.func_mgr.getExternalFunctions():
+            if ext.getName() == api:
+                # calls to external entrypoint (rare) + thunks referencing it (par refs)
+                sites |= self._collect_calls_to_addr(ext.getEntryPoint())
+                refs = self.ref_mgr.getReferencesTo(ext.getEntryPoint())
+                for r in refs:
+                    frm = r.getFromAddress()
+                    tf = self.func_mgr.getFunctionContaining(frm)
+                    if tf and tf.isThunk():
+                        sites |= self._collect_calls_to_thunk(tf)
+
+        return list(sites)
+
+    def _build_api_call_map(self):
+        apis = []
+        apis.extend(self.APIS_QUERYINTERFACE)
+        apis.extend(self.APIS_PROPVARIANT)
+        apis.extend(self.APIS_SAFEARRAY)
+        apis.extend(self.APIS_VARIANT)
+
+        for api in apis:
+            calls = self._collect_calls_for_api(api)
+            if calls:
+                self.api_calls[api] = calls
+
+    def _find_dynamic_cast_sites(self):
+        sites = set()
+        # functions in program
+        for func in self.func_mgr.getFunctions(True):
+            if "RTDynamicCast" in func.getName():
+                refs = self.ref_mgr.getReferencesTo(func.getEntryPoint())
+                for r in refs:
+                    if r.getReferenceType().isCall():
+                        sites.add(r.getFromAddress().getOffset())
+        # external functions
+        for func in self.func_mgr.getExternalFunctions():
+            if "RTDynamicCast" in func.getName():
+                refs = self.ref_mgr.getReferencesTo(func.getEntryPoint())
+                for r in refs:
+                    if r.getReferenceType().isCall():
+                        sites.add(r.getFromAddress().getOffset())
+        return sites
+
+    # -------------------------
+    # A2/A11: 2-pass CALLIND analysis
+    # -------------------------
+    def _is_indirect_call_instr(self, instr):
+        if instr is None:
+            return False
+        if instr.getMnemonicString() != "CALL":
+            return False
+        op = instr.getDefaultOperandRepresentation(0)
+        if op is None:
+            return False
+        op = op.strip()
+        # heuristique x64 : call reg / call [mem]
+        regs = ["RAX","RBX","RCX","RDX","RSI","RDI","R8","R9","R10","R11","R12","R13","R14","R15"]
+        if op in regs:
+            return True
+        if "[" in op and "]" in op:
+            return True
+        return False
+
+    def _candidate_functions_for_decompile(self):
+        # Pass 1: repérer fonctions qui contiennent au moins 1 indirect call
+        cands = []
+        for func in self.func_mgr.getFunctions(True):
+            name = func.getName()
+            if name.startswith("__") or name.startswith("??") or name.startswith("_"):
+                continue
+            body = func.getBody()
+            found = False
+            for instr in self.listing.getInstructions(body, True):
+                if self._is_indirect_call_instr(instr):
+                    found = True
+                    break
+            if found:
+                cands.append(func)
+        return cands
+
+    def _varnode_is_const(self, vn):
+        try:
+            return vn is not None and vn.isConstant()
+        except:
+            return False
+
+    def _classify_callind_target(self, target_vn):
+        """
+        Retourne (is_vtable_like, is_variable_index)
+        - is_vtable_like: chaîne obj->vptr->fptr
+        - is_variable_index: offset non constant dans la vtable
+        """
+        if target_vn is None:
+            return (False, False)
+
+        defop = target_vn.getDef()
+        if defop is None:
+            return (False, False)
+
+        # On cherche un LOAD final qui lit un function pointer
+        if defop.getOpcode() != PcodeOp.LOAD:
+            return (False, False)
+
+        addr_vn = defop.getInput(1)
+        if addr_vn is None:
+            return (False, False)
+
+        add_def = addr_vn.getDef()
+        if add_def is None:
+            # LOAD [something] sans def -> pas clair
+            return (True, True)
+
+        # PTRADD/INT_ADD qui calcule vptr + offset
+        if add_def.getOpcode() in [PcodeOp.PTRADD, PcodeOp.INT_ADD]:
+            base = add_def.getInput(0)
+            off  = add_def.getInput(1) if add_def.getNumInputs() > 1 else None
+
+            var_index = (off is not None and (not self._varnode_is_const(off)))
+
+            # base doit venir d'un LOAD (lecture vptr depuis objet)
+            if base is not None:
+                bdef = base.getDef()
+                if bdef and bdef.getOpcode() == PcodeOp.LOAD:
+                    return (True, var_index)
+
+            return (True, var_index)
+
+        # Autres formes (table dispatch, callbacks) -> pas vtable-like
+        return (False, False)
+
+    def detect_A2_A11(self):
+        if self.fast_mode:
+            print("[A2/A11] FAST mode: skipping CALLIND decompiler analysis")
+            return
+
+        print("[A2/A11] 2-pass analysis (candidates -> decompile)")
+        cands = self._candidate_functions_for_decompile()
+        print("  Candidates for decompile: {}".format(len(cands)))
+
+        analyzed = 0
+        for func in cands:
+            analyzed += 1
+            if analyzed % 200 == 0:
+                print("  ... decompiled {} / {}".format(analyzed, len(cands)))
+
+            res = self.decomp.decompileFunction(func, 20, monitor)
+            if not res or not res.decompileCompleted():
+                continue
+            hf = res.getHighFunction()
+            if hf is None:
+                continue
+
+            # iterate pcode
+            blocks = hf.getBasicBlocks()
+            for blk in blocks:
+                it = blk.getIterator()
+                while it.hasNext():
+                    op = it.next()
+                    if op.getOpcode() == PcodeOp.CALLIND:
+                        call_addr = op.getSeqnum().getTarget()
+                        tgt = op.getInput(0)
+
+                        is_vtbl, is_var = self._classify_callind_target(tgt)
+                        if is_var:
+                            self._add_finding({
+                                "pattern": "A11_VARIABLE_VTABLE_INDEX",
+                                "address": str(call_addr),
+                                "function": func.getName(),
+                                "risk": "CRITICAL",
+                                "description": "CALLIND target depends on non-constant offset (potential arbitrary vtable index)"
+                            })
+                            continue
+
+                        if is_vtbl:
+                            if not self._has_nearby_dynamic_cast(call_addr):
+                                self._add_finding({
+                                    "pattern": "A2_UNSAFE_DOWNCAST",
+                                    "address": str(call_addr),
+                                    "function": func.getName(),
+                                    "risk": "HIGH",
+                                    "description": "Virtual-like CALLIND without nearby __RTDynamicCast verification"
+                                })
+
+    # fallback A11 (disasm) pour capter quelques cas sans decomp
+    def detect_A11_disasm_fallback(self):
+        print("[A11] Disasm fallback scan...")
+        for func in self.func_mgr.getFunctions(True):
+            body = func.getBody()
+            for instr in self.listing.getInstructions(body, True):
+                if instr.getMnemonicString() == "CALL":
+                    op = instr.getDefaultOperandRepresentation(0)
+                    if op and ("*" in op and "[" in op):
+                        self._add_finding({
+                            "pattern": "A11_VARIABLE_VTABLE_INDEX",
+                            "address": str(instr.getAddress()),
+                            "function": func.getName(),
+                            "operand": op,
+                            "risk": "CRITICAL",
+                            "description": "Indirect CALL with complex addressing (heuristic variable vtable index)"
+                        })
+
+    # -------------------------
+    # B*: imports / Windows APIs
+    # -------------------------
+    def _emit_api_calls(self, api, pattern, risk, desc_tmpl):
+        calls = self.api_calls.get(api, [])
+        for a in calls:
+            f = self._get_func_containing(a)
+            self._add_finding({
+                "pattern": pattern,
+                "address": str(a),
+                "function": f.getName() if f else "unknown",
+                "api": api,
+                "risk": risk,
+                "description": desc_tmpl.format(api)
+            })
+
+    def detect_B_import_patterns(self):
+        print("[B*] Import/API based patterns...")
+
+        # QueryInterface
+        for api in self.APIS_QUERYINTERFACE:
+            self._emit_api_calls(api, "B1_QUERYINTERFACE", "HIGH",
+                                 "{} - COM QI: verify IID, HRESULT, and target interface assumptions")
+
+        # PROPVARIANT
+        for api in self.APIS_PROPVARIANT:
+            self._emit_api_calls(api, "B2_PROPVARIANT", "CRITICAL",
+                                 "{} - PROPVARIANT: verify vt before union access / conversions")
+
+        # SAFEARRAY
+        for api in self.APIS_SAFEARRAY:
+            self._emit_api_calls(api, "B3_SAFEARRAY", "HIGH",
+                                 "{} - SAFEARRAY: verify fFeatures + element type + bounds")
+
+        # VARIANT
+        for api in self.APIS_VARIANT:
+            self._emit_api_calls(api, "B7_VARIANT", "HIGH",
+                                 "{} - VARIANT: verify vt before union access")
+
+    # -------------------------
+    # C*: memory patterns
+    # -------------------------
+    def detect_C1_placement_new(self):
+        print("[C1] Scanning for placement new...")
+        # on match sur signature/noms, pas seulement un mangling exact
+        for func in self.func_mgr.getFunctions(True):
+            n = func.getName()
+            sig = str(func.getSignature(True)) if func.getSignature(True) else ""
+            if ("operator new" in n and "void *" in sig) or ("operator new" in n and "placement" in sig.lower()):
+                refs = self.ref_mgr.getReferencesTo(func.getEntryPoint())
+                for r in refs:
+                    if r.getReferenceType().isCall():
+                        caller = self._get_func_containing(r.getFromAddress())
+                        self._add_finding({
+                            "pattern": "C1_PLACEMENT_NEW",
+                            "address": str(r.getFromAddress()),
+                            "function": caller.getName() if caller else "unknown",
+                            "risk": "HIGH",
+                            "description": "Placement new call site - verify memory was not reused for different type / lifetime"
+                        })
+
+    def detect_C7_allocator_mismatch(self):
+        print("[C7] Scanning for allocator mismatch...")
+        for func in self.func_mgr.getFunctions(True):
+            has_new = False
+            has_delete = False
+            has_malloc = False
+            has_free = False
+
+            body = func.getBody()
+            for instr in self.listing.getInstructions(body, True):
+                if instr.getMnemonicString() != "CALL":
+                    continue
+                for ref in instr.getReferencesFrom():
+                    target = self.func_mgr.getFunctionAt(ref.getToAddress())
+                    if not target:
+                        continue
+                    name = target.getName()
+                    sig = str(target.getSignature(True)) if target.getSignature(True) else ""
+
+                    if "operator new" in name or "??2@" in name:
+                        # ignore placement new heuristically (has void* param)
+                        if "void *" in sig:
+                            continue
+                        has_new = True
+                    if "operator delete" in name or "??3@" in name:
+                        has_delete = True
+                    if name in ["malloc", "_malloc", "calloc", "_calloc", "realloc", "_realloc"]:
+                        has_malloc = True
+                    if name in ["free", "_free"]:
+                        has_free = True
+
+            if (has_new and has_free) or (has_malloc and has_delete):
+                mismatch = "new/free" if (has_new and has_free) else "malloc/delete"
+                self._add_finding({
+                    "pattern": "C7_ALLOCATOR_MISMATCH",
+                    "address": str(func.getEntryPoint()),
+                    "function": func.getName(),
+                    "mismatch_type": mismatch,
+                    "risk": "CRITICAL",
+                    "description": "Allocator mismatch ({}) - heap corruption / type lifetime confusion risk".format(mismatch)
+                })
+
+    # -------------------------
+    # E*: naming heuristics (deserializers/factories)
+    # -------------------------
+    def detect_E1_deserializers(self):
+        print("[E1] Scanning for deserializers...")
+        keywords = ["parse", "read", "decode", "unmarshal", "deserialize", "load", "from", "import", "unpack"]
+        for func in self.func_mgr.getFunctions(True):
+            name = func.getName().lower()
+            if name.startswith("_") or len(name) < 5:
+                continue
+            if any(kw in name for kw in keywords):
+                ret = func.getReturnType()
+                ret_str = str(ret) if ret else ""
+                if "*" in ret_str or "ptr" in ret_str.lower():
+                    self._add_finding({
+                        "pattern": "E1_DESERIALIZER",
+                        "address": str(func.getEntryPoint()),
+                        "function": func.getName(),
+                        "return_type": ret_str,
+                        "risk": "CRITICAL",
+                        "description": "Deserializer returning pointer - verify type validation / tag checks from input"
+                    })
+
+    def detect_E2_factories(self):
+        print("[E2] Scanning for factories...")
+        keywords = ["create", "make", "build", "alloc", "factory", "construct", "spawn", "instantiate", "new"]
+        for func in self.func_mgr.getFunctions(True):
+            name = func.getName().lower()
+            if name.startswith("_") or name.startswith("??"):
+                continue
+            if any(kw in name for kw in keywords):
+                ret = func.getReturnType()
+                ret_str = str(ret) if ret else ""
+                if "*" in ret_str:
+                    self._add_finding({
+                        "pattern": "E2_FACTORY",
+                        "address": str(func.getEntryPoint()),
+                        "function": func.getName(),
+                        "return_type": ret_str,
+                        "risk": "HIGH",
+                        "description": "Factory returning pointer - verify caller enforces expected dynamic type"
+                    })
+
+    # -------------------------
+    # Summary / export
+    # -------------------------
+    def _rank_score(self, f):
+        p = f.get("pattern", "")
+        # ordre triage (plus score = plus haut)
+        if p == "A11_VARIABLE_VTABLE_INDEX":
+            return 100
+        if p == "C7_ALLOCATOR_MISMATCH":
+            return 90
+        if p == "B2_PROPVARIANT":
+            return 80
+        if p == "E1_DESERIALIZER":
+            return 70
+        if p == "A2_UNSAFE_DOWNCAST":
+            return 60
+        return 10
+
+    def _print_summary(self):
+        by_risk = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        by_pattern = {}
+        for f in self.findings:
+            r = f.get("risk", "MEDIUM")
+            p = f.get("pattern", "UNKNOWN")
+            by_risk[r] = by_risk.get(r, 0) + 1
+            by_pattern[p] = by_pattern.get(p, 0) + 1
+
+        print("")
+        print("=" * 60)
+        print("SUMMARY")
+        print("=" * 60)
+        print("Total findings: {}".format(len(self.findings)))
+        print("By risk:")
+        for r in ["CRITICAL", "HIGH", "MEDIUM"]:
+            c = by_risk.get(r, 0)
+            print("  {:10} : {}".format(r, c))
+        print("By pattern:")
+        items = sorted(by_pattern.items(), key=lambda x: -x[1])
+        for p, c in items:
+            print("  {:35} : {}".format(p, c))
+
+    def run(self):
+        print("=" * 60)
+        print("TYPE CONFUSION PATTERN DETECTOR")
+        print("=" * 60)
+        print("Binary: {}".format(self.program.getName()))
+        print("Mode: {}".format("FAST" if self.fast_mode else "FULL"))
+        print("")
+
+        # A2/A11 heavy part
+        self.detect_A2_A11()
+        # disasm fallback for A11 (captures some even in FAST)
+        self.detect_A11_disasm_fallback()
+
+        # Windows imports
+        self.detect_B_import_patterns()
+
+        # memory / alloc
+        self.detect_C1_placement_new()
+        self.detect_C7_allocator_mismatch()
+
+        # heuristics
+        self.detect_E1_deserializers()
+        self.detect_E2_factories()
+
+        # sort for triage
+        self.findings.sort(key=lambda f: (-self._rank_score(f), f.get("pattern", ""), f.get("address", "")))
+
+        self._print_summary()
+
+    def export(self, path):
+        by_risk = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        by_pattern = {}
+        for f in self.findings:
+            r = f.get("risk", "MEDIUM")
+            p = f.get("pattern", "UNKNOWN")
+            by_risk[r] = by_risk.get(r, 0) + 1
+            by_pattern[p] = by_pattern.get(p, 0) + 1
+
+        out = {
+            "binary": self.program.getName(),
+            "findings": self.findings,
+            "stats": {"total": len(self.findings), "by_risk": by_risk, "by_pattern": by_pattern}
+        }
+        with open(path, 'w') as f:
+            json.dump(out, f, indent=2)
+        print("[+] Exported to {}".format(path))
+
+
+# MAIN
+args = getScriptArgs()
+out_path = "/tmp/patterns_output.json"
+fast = False
+
+if args and len(args) >= 1:
+    out_path = args[0]
+if args and len(args) >= 2:
+    # any second arg enables fast (run_analysis.sh will pass "fast")
+    fast = True
+
+d = PatternDetector(fast_mode=fast)
+d.run()
+d.export(out_path)
+```
+
+---
+
+## 1.3 `~/type_confusion/scripts/run_analysis.sh` (patch “chef”)
+
+✅ Changements clés :
+
+* `--fast` : skip decomp lourd (A2), tu obtiens un triage rapide
+* `--full` : complet (par défaut)
+* `--force-import` / `--no-import` : évite de réimporter pour itérer vite
+* fallback `-process` si le nom diverge
+
+```bash
+#!/bin/bash
+# run_analysis.sh - Type Confusion Static Analysis Wrapper (v1.2)
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+MODE="full"
+IMPORT_MODE="auto"   # auto|force|skip
+
+usage() {
+  echo "Usage: $0 [--fast|--full] [--force-import|--no-import] <target.dll|exe> <output_dir>"
+  exit 1
+}
+
+# args parse
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --fast) MODE="fast"; shift ;;
+    --full) MODE="full"; shift ;;
+    --force-import) IMPORT_MODE="force"; shift ;;
+    --no-import) IMPORT_MODE="skip"; shift ;;
+    *) usage ;;
+  esac
+done
+
+TARGET="$1"
+OUTPUT_DIR="$2"
+[ -z "$TARGET" ] && usage
+[ -z "$OUTPUT_DIR" ] && usage
+
+if [ ! -f "$TARGET" ]; then
+  echo -e "${RED}[-] Target not found: $TARGET${NC}"
+  exit 1
+fi
+
+TC_HOME="${TC_HOME:-$HOME/type_confusion}"
+SCRIPTS_DIR="$TC_HOME/scripts"
+
+if [ -z "$GHIDRA_HOME" ]; then
+  echo -e "${RED}[-] GHIDRA_HOME not set${NC}"
+  exit 1
+fi
+
+TARGET_BASENAME=$(basename "$TARGET")
+TARGET_NAME="${TARGET_BASENAME%.*}"
+PROJECT_DIR="$TC_HOME/projects/${TARGET_NAME}_project"
+
+mkdir -p "$OUTPUT_DIR" "$PROJECT_DIR"
+
+echo "=============================================="
+echo "Type Confusion Static Analysis"
+echo "=============================================="
+echo "Target : $TARGET_BASENAME"
+echo "Output : $OUTPUT_DIR"
+echo "Mode   : $MODE"
+echo "Import : $IMPORT_MODE"
+echo ""
+
+# Decide import
+DO_IMPORT=1
+if [ "$IMPORT_MODE" = "skip" ]; then
+  DO_IMPORT=0
+elif [ "$IMPORT_MODE" = "auto" ]; then
+  # heuristic: if project dir not empty, skip import
+  if [ -n "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
+    DO_IMPORT=0
+  fi
+fi
+
+if [ "$DO_IMPORT" -eq 1 ]; then
+  echo -e "${GREEN}[STEP 1/4] Importing into Ghidra...${NC}"
+  "$GHIDRA_HOME/support/analyzeHeadless" \
+      "$PROJECT_DIR" "$TARGET_NAME" \
+      -import "$TARGET" \
+      -overwrite \
+      -analysisTimeoutPerFile 900 \
+      2>&1 | tee "$OUTPUT_DIR/step1_import.log"
+else
+  echo -e "${YELLOW}[STEP 1/4] Skipping import (project exists)${NC}"
+fi
+
+run_headless_with_fallback_process() {
+  local script="$1"
+  local outjson="$2"
+  local extra="$3"
+
+  set +e
+  "$GHIDRA_HOME/support/analyzeHeadless" \
+      "$PROJECT_DIR" "$TARGET_NAME" \
+      -process "$TARGET_BASENAME" \
+      -noanalysis \
+      -scriptPath "$SCRIPTS_DIR" \
+      -postScript "$script" "$outjson" $extra \
+      2>&1
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo -e "${YELLOW}[!] -process '$TARGET_BASENAME' failed, retrying with '$TARGET_NAME'...${NC}"
+    "$GHIDRA_HOME/support/analyzeHeadless" \
+        "$PROJECT_DIR" "$TARGET_NAME" \
+        -process "$TARGET_NAME" \
+        -noanalysis \
+        -scriptPath "$SCRIPTS_DIR" \
+        -postScript "$script" "$outjson" $extra \
+        2>&1
+    rc=$?
+  fi
+  set -e
+  return $rc
+}
+
+echo -e "${GREEN}[STEP 2/4] Extracting RTTI...${NC}"
+run_headless_with_fallback_process "extract_rtti.py" "$OUTPUT_DIR/rtti.json" "" | tee "$OUTPUT_DIR/step2_rtti.log"
+
+echo -e "${GREEN}[STEP 3/4] Detecting patterns...${NC}"
+EXTRA=""
+if [ "$MODE" = "fast" ]; then
+  EXTRA="fast"
+fi
+run_headless_with_fallback_process "detect_patterns.py" "$OUTPUT_DIR/patterns.json" "$EXTRA" | tee "$OUTPUT_DIR/step3_patterns.log"
+
+echo -e "${GREEN}[STEP 4/4] Generating report...${NC}"
+
+python3 << PYTHON
+import json
+
+with open("$OUTPUT_DIR/rtti.json") as f:
+    rtti = json.load(f)
+with open("$OUTPUT_DIR/patterns.json") as f:
+    patterns = json.load(f)
+
+report = []
+report.append("# Type Confusion Analysis Report")
+report.append("## Target: $TARGET_BASENAME")
+report.append("")
+
+report.append("## RTTI Summary")
+report.append("- Classes: {}".format(rtti.get('stats', {}).get('total_classes', 0)))
+report.append("- VTables: {}".format(rtti.get('stats', {}).get('total_vtables', 0)))
+report.append("- Multiple inheritance: {}".format(rtti.get('stats', {}).get('multiple_inheritance', 0)))
+report.append("- Virtual inheritance: {}".format(rtti.get('stats', {}).get('virtual_inheritance', 0)))
+report.append("")
+
+stats = patterns.get("stats", {})
+report.append("## Findings: {}".format(stats.get('total', 0)))
+report.append("- CRITICAL: {}".format(stats.get('by_risk', {}).get('CRITICAL', 0)))
+report.append("- HIGH: {}".format(stats.get('by_risk', {}).get('HIGH', 0)))
+report.append("")
+
+crit = [x for x in patterns.get("findings", []) if x.get("risk") == "CRITICAL"]
+high = [x for x in patterns.get("findings", []) if x.get("risk") == "HIGH"]
+
+if crit:
+    report.append("## Critical Findings (Top)")
+    for f in crit[:40]:
+        report.append("### {}".format(f.get("pattern")))
+        report.append("- Address: {}".format(f.get("address", "N/A")))
+        report.append("- Function: {}".format(f.get("function", "N/A")))
+        if "api" in f:
+            report.append("- API: {}".format(f.get("api")))
+        report.append("- {}".format(f.get("description", "")))
+        report.append("")
+
+if high:
+    report.append("## High Findings (Top)")
+    for f in high[:40]:
+        report.append("### {}".format(f.get("pattern")))
+        report.append("- Address: {}".format(f.get("address", "N/A")))
+        report.append("- Function: {}".format(f.get("function", "N/A")))
+        if "api" in f:
+            report.append("- API: {}".format(f.get("api")))
+        report.append("- {}".format(f.get("description", "")))
+        report.append("")
+
+with open("$OUTPUT_DIR/report.md", "w") as f:
+    f.write("\n".join(report))
+
+with open("$OUTPUT_DIR/findings.csv", "w") as f:
+    f.write("Pattern,Risk,Address,Function,API,Description\n")
+    for x in patterns.get("findings", []):
+        row = [
+            x.get("pattern",""),
+            x.get("risk",""),
+            x.get("address",""),
+            (x.get("function","") or "").replace(",", ";"),
+            x.get("api",""),
+            (x.get("description","") or "").replace(",", ";"),
+        ]
+        f.write(",".join(['"{}"'.format(c) for c in row]) + "\n")
+
+print("[+] Report: $OUTPUT_DIR/report.md")
+print("[+] CSV   : $OUTPUT_DIR/findings.csv")
+PYTHON
+
+echo ""
+echo "=============================================="
+echo -e "${GREEN}ANALYSIS COMPLETE${NC}"
+echo "=============================================="
+
+CRITICAL=$(jq '.stats.by_risk.CRITICAL // 0' "$OUTPUT_DIR/patterns.json")
+HIGH=$(jq '.stats.by_risk.HIGH // 0' "$OUTPUT_DIR/patterns.json")
+TOTAL=$(jq '.stats.total // 0' "$OUTPUT_DIR/patterns.json")
+
+echo "Findings: $TOTAL (CRITICAL: $CRITICAL, HIGH: $HIGH)"
+echo "cat $OUTPUT_DIR/report.md"
+echo "jq '.findings[] | select(.risk==\"CRITICAL\")' $OUTPUT_DIR/patterns.json"
+```
+
+---
+
+# 2) Plan “Chef de projet” : TODOs + résultats attendus
+
+## Milestone M0 — “Repo clean & runnable”
+
+**TODOs**
+
+* [ ] Copier les 3 fichiers patchés :
+
+  * `scripts/extract_rtti.py`
+  * `scripts/detect_patterns.py`
+  * `scripts/run_analysis.sh`
+* [ ] `chmod +x scripts/run_analysis.sh`
+
+**Résultats attendus**
+
+* `./scripts/run_analysis.sh --fast targets/X.dll output/run_fast` termine sans crash
+* `output/run_fast/rtti.json` et `patterns.json` existent et sont du JSON valide
+
+**Critère d’acceptation**
+
+* `jq . output/run_fast/patterns.json` OK
+* `jq . output/run_fast/rtti.json` OK
+
+---
+
+## Milestone M1 — “RTTI coverage OK”
+
+**TODOs**
+
+* [ ] Lancer sur une DLL C++ avec RTTI (ta cible réelle, ou une DLL MSVC C++ connue)
+* [ ] Vérifier le ratio vtables/classes
+
+**Résultats attendus**
+
+* `rtti.json.stats.total_classes > 0`
+* `rtti.json.stats.total_vtables > 0`
+* `warnings` non vide si MI/VI présent
+
+**Critère d’acceptation**
+
+* `jq '.stats' output/run_full/rtti.json` montre des chiffres cohérents
+* `jq '.vtables[0].entries[0]' ...` existe (au moins une vtable avec entrées)
+
+---
+
+## Milestone M2 — “Imports Windows réellement captés”
+
+**TODOs**
+
+* [ ] Lancer sur un binaire qui utilise `oleaut32` (`Variant*`, `SafeArray*`, `PropVariant*`)
+* [ ] Vérifier que B2/B3/B7 sortent des callsites
+
+**Résultats attendus**
+
+* `patterns.json.stats.by_pattern.B7_VARIANT > 0` ou `B3_SAFEARRAY > 0` si l’API est présente
+* Les findings ont `api` + `function` non “unknown” la plupart du temps
+
+**Critère d’acceptation**
+
+* `jq '.findings[] | select(.pattern=="B7_VARIANT") | .api'` renvoie des APIs
+* `jq '.findings[] | select(.pattern=="B7_VARIANT") | .function'` ≠ "unknown" sur une partie
+
+---
+
+## Milestone M3 — “A2/A11 scalable (perf + signal)”
+
+**TODOs**
+
+* [ ] Run en `--full` sur une DLL moyenne
+* [ ] Vérifier que `Candidates for decompile` n’est pas proche du nombre total de fonctions (sinon trop large)
+* [ ] Inspecter 3 findings A11 / A2 avec `inspect_address.py`
+
+**Résultats attendus**
+
+* A2 : moins de bruit (pas des milliers systématiques)
+* A11 : findings plus rares mais “vraiment dangereux”
+
+**Critère d’acceptation**
+
+* `patterns.json` contient des A2/A11 *raisonnables* (selon taille binaire)
+* `inspect_address.py` donne un contexte exploitable autour des adresses
+
+---
+
+## Milestone M4 — “Triage workflow (exploitation pratique)”
+
+**TODOs**
+
+* [ ] Définir un flux :
+
+  1. `--fast` pour triage
+  2. `--full` uniquement sur binaire intéressant
+  3. inspect top CRITICAL
+* [ ] Ajouter un “worklog” par cible (optionnel)
+
+**Résultats attendus**
+
+* En 2 commandes, tu obtiens :
+
+  * top CRITICAL trié
+  * un rapport lisible + CSV
+
+**Critère d’acceptation**
+
+* `cat report.md` est lisible et ordonné
+* `findings.csv` s’ouvre correctement dans Excel
+
+---
+
+# 3) Mode d’emploi recommandé (logistique efficace)
+
+### Triage rapide
+
+```bash
+./scripts/run_analysis.sh --fast targets/target.dll output/triage_001
+jq '.stats' output/triage_001/patterns.json
+jq '.findings[] | select(.risk=="CRITICAL") | {pattern,address,function,api}' output/triage_001/patterns.json
+```
+
+### Full seulement si “ça vaut le coup”
+
+```bash
+./scripts/run_analysis.sh --full --no-import targets/target.dll output/full_001
+```
+
+### Inspect d’une adresse critique
+
+```bash
+$GHIDRA_HOME/support/analyzeHeadless \
+  ~/type_confusion/projects/target_project target \
+  -process target.dll -noanalysis \
+  -scriptPath ~/type_confusion/scripts \
+  -postScript inspect_address.py 0x140012345
+```
