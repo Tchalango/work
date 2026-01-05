@@ -1,3 +1,171 @@
-EXE="/mnt/c/Windows/System32/dcomp.exe"
-cd ~/type_confusion
-./scripts/run_analysis.sh --fast --force-import "$EXE" "output/dcomp_fast_$(date +%Y%m%d_%H%M%S)"
+Nickel — ton screenshot montre que **le pipeline tourne pour de vrai** sur `dcomp.dll` et qu’il a déjà sorti une **première “carte” d’angles d’attaque** :
+
+* **A001 (189)** = “virtual dispatch sans validation” → très fréquent → souvent beaucoup de bruit, mais ça sert à trouver les zones OO chaudes.
+* **B002 (2)** = `PropVariantClear/Copy` → rare → **très bon candidat à triager en premier**.
+* **B005 (5)** = `CoCreateInstance/CoGetClassObject` → intéressant (COM/factories) → à vérifier si CLSID/IID ou chemins d’erreur mal gérés.
+
+Je te donne maintenant un **plan d’actions + commandes** pour passer de “j’ai un report” à “j’ai 2-3 sites P1 à regarder”.
+
+---
+
+## 1) Fixe les variables (copier-coller)
+
+Adapte juste le dossier `OUT` si besoin.
+
+```bash
+TC_HOME="$HOME/type_confusing"
+OUT="$TC_HOME/output/dcomp_final1"
+
+# projet ghidra créé par ton wrapper (souvent: projects/<name>_project)
+PROJ="$TC_HOME/projects/dcomp_project"
+NAME="dcomp"
+BIN="/mnt/c/Windows/System32/dcomp.dll"
+```
+
+---
+
+## 2) Regarde la forme exacte de `findings.json` (1 commande)
+
+Ça évite de deviner les champs (pattern/category/etc.).
+
+```bash
+jq 'keys' "$OUT/findings.json"
+jq '.findings[0]' "$OUT/findings.json" | sed -n '1,80p'
+```
+
+---
+
+## 3) Extraire **B002** (PropVariant) + **B005** (COM) (commande robuste)
+
+Même si tes champs s’appellent `pattern` ou `category`, ça marche parce qu’on matche au texte.
+
+```bash
+# B002: PropVariant
+jq -r '
+  .findings[]
+  | select(((.pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
+  | "\(.address) | \(.function // "unknown") | \(.api // .title // "n/a")"
+' "$OUT/findings.json"
+
+# B005: COM create
+jq -r '
+  .findings[]
+  | select(((.pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
+  | "\(.address) | \(.function // "unknown") | \(.api // .title // "n/a")"
+' "$OUT/findings.json"
+```
+
+👉 Objectif : avoir **les 2 adresses B002** et les **5 adresses B005**.
+
+---
+
+## 4) Inspect automatique des adresses (génère des fichiers texte)
+
+Ça te sort le **code décompilé + instructions autour** sans GUI (parfait sur tunnel).
+
+### Inspect B002 (priorité #1)
+
+```bash
+mkdir -p "$OUT/inspect"
+
+jq -r '
+  .findings[]
+  | select(((.pattern // .category // .id // "")|tostring|test("B002|PropVariant";"i")))
+  | .address
+' "$OUT/findings.json" \
+| while read -r ADDR; do
+    echo "[*] Inspect $ADDR"
+    "$GHIDRA_HOME/support/analyzeHeadless" \
+      "$PROJ" "$NAME" \
+      -process "$(basename "$BIN")" \
+      -noanalysis \
+      -scriptPath "$TC_HOME/scripts" \
+      -postScript inspect_address.py "$ADDR" \
+      > "$OUT/inspect/B002_${ADDR//:/_}.txt" 2>&1
+  done
+```
+
+### Inspect B005 (COM)
+
+```bash
+jq -r '
+  .findings[]
+  | select(((.pattern // .category // .id // "")|tostring|test("B005|CoCreateInstance|CoGetClassObject";"i")))
+  | .address
+' "$OUT/findings.json" \
+| while read -r ADDR; do
+    echo "[*] Inspect $ADDR"
+    "$GHIDRA_HOME/support/analyzeHeadless" \
+      "$PROJ" "$NAME" \
+      -process "$(basename "$BIN")" \
+      -noanalysis \
+      -scriptPath "$TC_HOME/scripts" \
+      -postScript inspect_address.py "$ADDR" \
+      > "$OUT/inspect/B005_${ADDR//:/_}.txt" 2>&1
+  done
+```
+
+---
+
+## 5) Comment décider “P1 exploitable” en 2 minutes par fichier
+
+### Pour **B002 PropVariant**
+
+Dans chaque `B002_*.txt`, cherche :
+
+* est-ce que le code **lit un champ union** (`pwszVal`, `bstrVal`, `ulVal`, `punkVal`, etc.) ?
+* est-ce qu’il y a un check clair du tag (`vt`) **juste avant** ?
+* est-ce que ça vient d’un flux externe (property store, metadata, parsing) ?
+
+Commande pour repérer vite :
+
+```bash
+grep -nEi "vt|V_VT|PropVariant|pwsz|bstr|punk|ulVal|llVal" "$OUT/inspect"/B002_*.txt | head -n 80
+```
+
+### Pour **B005 COM**
+
+Tu cherches :
+
+* CLSID/IID d’où ils viennent (constants vs input)
+* HRESULT checké ?
+* usage du pointeur retourné : cast/virtual call juste après ?
+
+```bash
+grep -nEi "CoCreateInstance|CoGetClassObject|CLSID|IID|hresult|SUCCEEDED|FAILED|QueryInterface" \
+  "$OUT/inspect"/B005_*.txt | head -n 120
+```
+
+---
+
+## 6) Et A001 (189) ? (comment le rendre utile sans te noyer)
+
+A001 en masse = normal sur une DLL C++.
+
+Ce que tu veux faire :
+
+* **cluster par fonction** → tu priorises les fonctions qui ont 5–20 occurrences (souvent des dispatchers), puis tu regardes celles où l’objet vient de parsing.
+
+Exemple (si tes champs le permettent) :
+
+```bash
+jq -r '
+  .findings[]
+  | select(((.pattern // .category // .id // "")|tostring|test("A001|Virtual dispatch";"i")))
+  | (.function // "unknown")
+' "$OUT/findings.json" | sort | uniq -c | sort -nr | head -n 30
+```
+
+---
+
+## Ce que je te propose maintenant
+
+Ouvre juste **un** des fichiers générés :
+
+* `output/dcomp_final1/inspect/B002_....txt`
+
+Copie/colle ici le bloc **DECOMPILED CODE** + 20 lignes autour (ou colle le fichier entier si tu veux), et je te fais la lecture “review vuln” :
+
+* où est l’input,
+* quel check manque,
+* quelle hypothèse de type confusion tester en premier.
